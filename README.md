@@ -1,6 +1,6 @@
 # Blueprint analyzer (walls + rooms)
 
-Service that preprocesses blueprint images, fuses **classical CV wall evidence** (adaptive/Otsu thresholds, Hough line segments, auto-Canny) with optional **YOLOv8-seg** masks, refines the binary wall mask, then derives **rooms** (morphology + watershed) and **fixtures** (heuristics). FastAPI exposes `/predict` and `/predict/image`.
+Service that preprocesses blueprint images (including **text-region suppression**), fuses **six classical wall cues** (adaptive/Otsu thresholds, Hough line segments, auto-Canny, **morphological gradient**, **directional** horizontal/vertical structure) plus **collinear Hough segment bridging**, then optionally blends **YOLOv8s-seg** instance masks. The refined wall mask feeds **rooms** (morphology + watershed + simplified contours) and **fixtures** (heuristics with circle validation on lights). FastAPI exposes `/predict` and `/predict/image`.
 
 ## Setup
 
@@ -17,7 +17,7 @@ Service that preprocesses blueprint images, fuses **classical CV wall evidence**
    pip install -r requirements.txt
    ```
 
-   On first run, Ultralytics downloads `yolov8n-seg.pt` (pretrained COCO weights) and exports it to ONNX automatically.
+   On first run, Ultralytics downloads **`yolov8s-seg.pt`** (small segmentation, pretrained COCO weights) and exports it to ONNX automatically.
 
    PDF uploads: the first page is rasterized at **300 DPI** (see `utils._pdf_first_page_to_bytes`).
 
@@ -53,7 +53,7 @@ curl -X POST "http://127.0.0.1:8000/predict" -F "file=@blueprint.pdf" -o respons
 Response fields:
 
 - `num_walls`: wall contours kept after **minimum area 500 px²** (see `MIN_CONTOUR_AREA` in `wall_detection`).
-- `num_rooms`: room contours after **morphology + watershed** candidates, **border removal** (full-sheet rectangles dropped), **shape filters** (min area ≈ max(500, 0.1% of image), max ≈ 85% of image, aspect and solidity checks), and **bbox overlap merging**—not the same rule as walls alone.
+- `num_rooms`: room contours after **morphology + watershed** candidates, **border removal** (full-sheet rectangles dropped), **shape filters** (min area ≈ max(500, 0.1% of image), max ≈ 85% of image, aspect and solidity checks), **`approxPolyDP` simplification**, and **bbox overlap merging**—not the same rule as walls alone.
 - `avg_wall_thickness`: pixels from the distance transform on the binary `wall_mask`, using **IQR-trimmed** interior distances then **twice the mean** of the inliers; not calibrated to real units.
 - `fixtures`: object with `lights`, `doors`, `windows` counts (heuristic; see **Fixtures** below).
 - `image_base64`: annotated PNG, base64-encoded. Decode with `base64.b64decode` to get raw PNG bytes.
@@ -69,13 +69,14 @@ curl -X POST "http://127.0.0.1:8000/predict/image" -F "file=@blueprint.pdf" -o r
 
 ## Preprocessing (`utils.preprocess_blueprint`)
 
-Before wall detection, grayscale is derived by picking the **highest-contrast** channel among L/A/B from LAB, raw gray, and BGR gray; the image may be **inverted** if it reads as dark-on-light. **Deskewing** uses `HoughLines` on edges (small angles only). **Border stripping** clears margins where edge density suggests a frame. A **bilateral filter** reduces noise while preserving edges.
+Grayscale uses the **highest-contrast** channel among L/A/B from LAB, raw gray, and BGR gray; the image may be **inverted** if it reads as dark-on-light. **Deskewing** uses `HoughLines` on edges (small angles only). **Border stripping** clears margins where edge density suggests a frame. **`_mask_text_regions`** detects high **local variance** blobs (Otsu on variance map, size/aspect filters) and paints them toward the background luminance to reduce lettering noise before walls are extracted. A **bilateral filter** runs last.
 
 ## Inference pipeline (`detect_walls`)
 
-1. **Classical wall mask**: On CLAHE-enhanced grayscale, build four binary maps—**adaptive Gaussian threshold**, **Otsu** (inverted), **HoughLinesP** line segments (two scales; axis-aligned lines get extra weight), and **median-based auto-Canny** with light dilation—then **fuse** them with fixed weights into one score map (threshold ≈ 0.35).
-2. **YOLOv8-seg**: Run **ONNX** first, then **PyTorch** if needed (`conf=0.3`, `iou=0.5`). If any instance masks exist, they are **blended** into the classical map with a small weight (~15%) and re-thresholded.
-3. **Refine**: **Morphological close/open**, drop tiny connected components, then **findContours** and filter by area; the returned mask is contour-**filled** when possible.
+1. **Classical fusion**: On CLAHE-enhanced grayscale, build **six** binary cues—**adaptive Gaussian threshold**, **Otsu** (inverted), **HoughLinesP** (two scales; axis-aligned strokes boosted), **median-based auto-Canny** with light dilation, **morphological gradient** (Otsu on gradient magnitude), and **directional** masks (horizontal/vertical morphological opens on an Otsu binarization, then OR’d). Fixed weights sum into a score map; pixels with score **≥ ~0.30** are kept.
+2. **Line bridging**: **HoughLinesP** on auto-Canny edges feeds **`_merge_collinear_segments`**, which links nearly parallel segments whose endpoints are close; the result is **OR’d** into the fused mask to reinforce long wall lines.
+3. **YOLOv8s-seg**: Run **ONNX** first, then **PyTorch** if needed (`conf=0.25`, `iou=0.45`). If any instance masks exist, they are **blended** at **~15%** into the classical map and re-thresholded (**> 0.3** score).
+4. **Refine & output**: **Morphological close/open**, drop tiny connected components, **findContours**, area filter (**≥ 500 px²**), then **`approxPolyDP` simplification** on wall contours; the returned mask is contour-**filled** when possible.
 
 Rooms and fixtures use the resulting `wall_mask` as described below.
 
@@ -83,7 +84,7 @@ Rooms and fixtures use the resulting `wall_mask` as described below.
 
 Detected via OpenCV heuristics on **CLAHE-enhanced** grayscale (no fixture model):
 
-- **Lights**: `HoughCircles` with **resolution-dependent** radii and spacing; multiple blur/`param2` passes; duplicate centers suppressed — cyan circles.
+- **Lights**: `HoughCircles` with **resolution-dependent** radii and spacing; multiple blur/`param2` passes; each candidate is accepted only if **`_validate_circle`** finds enough **Canny edge** samples along the circumference; duplicate centers suppressed — cyan circles.
 - **Doors**: (1) **Arc-shaped** contours on non-wall Canny edges—convexity/solidity, ellipse fit, and **near-wall** check; (2) **shape** candidates from non-wall contours with **circularity/aspect/solidity** rules, gated by **near wall** or **near wall-break** regions (`dilate(wall) - wall`); combined list passed through **bounding-box IoU NMS** — magenta rectangles.
 - **Windows**: elongated contours (aspect thresholds) **near walls**, also **NMS**-deduplicated — yellow rectangles.
 
@@ -91,12 +92,14 @@ Detected via OpenCV heuristics on **CLAHE-enhanced** grayscale (no fixture model
 
 ## Approach & Design Choices
 
-- **Input normalization (`utils`)**: Blueprints are normalized for robust line extraction—**channel selection**, optional **invert**, **deskew**, **frame/border suppression**, and **bilateral** smoothing—before `wall_detection` runs.
+- **Input normalization (`utils`)**: Same as **Preprocessing** above: **channel selection**, **invert**, **deskew**, **border suppression**, **text-blob masking** (variance-based), then **bilateral** smoothing before `wall_detection`.
 
-- **Walls (`wall_detection`)**: A **multi-cue classical mask** (adaptive threshold, Otsu, multi-scale Hough segments, auto-Canny) is the primary signal. **YOLOv8-seg** (COCO, all instance masks OR’d together—no architectural class) **augments** that mask when masks are available; it is not an exclusive “DL then else CV” path. The result is **refined** with morphology and small-component removal, then **filled** wall contours drive the binary mask returned to rooms/fixtures/thickness.
+- **Walls (`wall_detection`)**: **Six classical cues** plus **collinear Hough bridging** form the main signal; **`yolov8s-seg.pt`** (COCO, all instance masks OR’d—no architectural class) **augments** at low weight when masks exist. Output wall contours are **simplified** with `approxPolyDP` for cleaner overlays.
 
-- **Rooms (`room_detection`)**: **Gaps in the wall mask** are closed first. Free space uses **morphological open/close** on the inverted mask and **CCOMP** contours, combined with a **watershed** split of the inverted mask (distance-transform seeds, `cv2.watershed` on free space). Candidates are **filtered** by area/aspect/solidity, **full-image border** contours removed, and **highly overlapping** room boxes merged.
+- **Rooms (`room_detection`)**: **Gaps in the wall mask** are closed first. Free space uses **morphological open/close** on the inverted mask and **CCOMP** contours, combined with **watershed** regions from distance-transform seeds. Candidates are **filtered**, **border** sheet contours dropped, contours **simplified** (`approxPolyDP`), then **overlapping** room boxes merged.
 
-- **Wall thickness**: **Distance transform** on the binary wall mask; interior distances are **filtered with an IQR rule** before averaging, then doubled to approximate thickness in **pixels** (uncalibrated).
+- **Wall thickness**: **Distance transform** on the binary wall mask; interior distances use an **IQR inlier mask** before averaging, then **doubled** for thickness in **pixels** (uncalibrated).
 
-- **Structure**: Modules stay separated—`utils` (load, preprocess, draw), `wall_detection` (walls + fixtures + thickness), `room_detection`, `model` (YOLO singletons + ONNX export), `main` (FastAPI)—so weights, fusion weights, and heuristics can evolve independently.
+- **Model (`model.py`)**: Singleton **PyTorch** and **ONNX** loaders for **`yolov8s-seg`** with automatic ONNX export (`imgsz=640`, `simplify=True`).
+
+- **Structure**: `utils` (load, preprocess, draw), `wall_detection` (walls + fixtures + thickness), `room_detection`, `model`, `main` (FastAPI)—fusion weights, YOLO `conf`/`iou`, and heuristics can be tuned independently.
