@@ -49,6 +49,32 @@ def _otsu_threshold_mask(gray: np.ndarray) -> np.ndarray:
     return thresh
 
 
+def _morphological_gradient_mask(gray: np.ndarray, image_shape: tuple) -> np.ndarray:
+    h, w = image_shape[:2]
+    k = max(2, min(h, w) // 400)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k, k))
+    gradient = cv2.morphologyEx(gray, cv2.MORPH_GRADIENT, kernel)
+    _, binary = cv2.threshold(gradient, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    return binary
+
+
+def _directional_wall_mask(gray: np.ndarray, image_shape: tuple) -> np.ndarray:
+    h, w = image_shape[:2]
+    length = max(10, min(h, w) // 40)
+
+    h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (length, 1))
+    v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, length))
+
+    blurred = cv2.GaussianBlur(gray, (3, 3), 0)
+    _, binary = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+    h_walls = cv2.morphologyEx(binary, cv2.MORPH_OPEN, h_kernel, iterations=1)
+    v_walls = cv2.morphologyEx(binary, cv2.MORPH_OPEN, v_kernel, iterations=1)
+
+    combined = cv2.bitwise_or(h_walls, v_walls)
+    return combined
+
+
 def _detect_lines_mask(gray: np.ndarray, image_shape: tuple) -> np.ndarray:
     h, w = image_shape[:2]
     edges = _auto_canny(gray)
@@ -81,6 +107,58 @@ def _detect_lines_mask(gray: np.ndarray, image_shape: tuple) -> np.ndarray:
     return boosted
 
 
+def _merge_collinear_segments(lines: np.ndarray | None, image_shape: tuple) -> np.ndarray:
+    h, w = image_shape[:2]
+    mask = np.zeros((h, w), dtype=np.uint8)
+    if lines is None:
+        return mask
+
+    angle_tol = 5.0
+    gap_tol = max(10, min(h, w) // 50)
+
+    segments = []
+    for line in lines:
+        x1, y1, x2, y2 = line[0]
+        angle = np.degrees(np.arctan2(y2 - y1, x2 - x1)) % 180
+        length = np.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
+        segments.append((x1, y1, x2, y2, angle, length))
+
+    merged_used = [False] * len(segments)
+
+    for i, (x1, y1, x2, y2, ang_i, len_i) in enumerate(segments):
+        if merged_used[i]:
+            continue
+        cv2.line(mask, (x1, y1), (x2, y2), 255, 2)
+
+        for j in range(i + 1, len(segments)):
+            if merged_used[j]:
+                continue
+            x3, y3, x4, y4, ang_j, _ = segments[j]
+            angle_diff = min(abs(ang_i - ang_j), 180 - abs(ang_i - ang_j))
+            if angle_diff > angle_tol:
+                continue
+
+            endpoint_pairs = [
+                ((x2, y2), (x3, y3)),
+                ((x2, y2), (x4, y4)),
+                ((x1, y1), (x3, y3)),
+                ((x1, y1), (x4, y4)),
+            ]
+            dists = [
+                np.sqrt((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2)
+                for a, b in endpoint_pairs
+            ]
+            best_idx = int(np.argmin(dists))
+            min_dist = dists[best_idx]
+
+            if min_dist < gap_tol:
+                pa, pb = endpoint_pairs[best_idx]
+                cv2.line(mask, pa, pb, 255, 2)
+                merged_used[j] = True
+
+    return mask
+
+
 def _remove_small_components(mask: np.ndarray, min_size: int) -> np.ndarray:
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
         mask, connectivity=8,
@@ -97,15 +175,19 @@ def _combine_wall_masks(
     otsu_mask: np.ndarray,
     line_mask: np.ndarray,
     canny_mask: np.ndarray,
+    gradient_mask: np.ndarray,
+    directional_mask: np.ndarray,
 ) -> np.ndarray:
     h, w = adaptive_mask.shape[:2]
     score = np.zeros((h, w), dtype=np.float32)
-    score += (adaptive_mask > 0).astype(np.float32) * 0.30
-    score += (otsu_mask > 0).astype(np.float32) * 0.25
-    score += (line_mask > 0).astype(np.float32) * 0.30
-    score += (canny_mask > 0).astype(np.float32) * 0.15
+    score += (adaptive_mask > 0).astype(np.float32) * 0.20
+    score += (otsu_mask > 0).astype(np.float32) * 0.15
+    score += (line_mask > 0).astype(np.float32) * 0.20
+    score += (canny_mask > 0).astype(np.float32) * 0.10
+    score += (gradient_mask > 0).astype(np.float32) * 0.15
+    score += (directional_mask > 0).astype(np.float32) * 0.20
 
-    combined = (score >= 0.35).astype(np.uint8) * 255
+    combined = (score >= 0.30).astype(np.uint8) * 255
     return combined
 
 
@@ -127,6 +209,18 @@ def _refine_wall_mask(mask: np.ndarray, image_shape: tuple) -> np.ndarray:
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, open_kernel, iterations=1)
 
     return mask
+
+
+def _simplify_contours(contours: list) -> list:
+    epsilon_factor = 0.005
+    simplified = []
+    for c in contours:
+        peri = cv2.arcLength(c, True)
+        eps = epsilon_factor * peri
+        approx = cv2.approxPolyDP(c, eps, True)
+        if cv2.contourArea(approx) >= MIN_CONTOUR_AREA:
+            simplified.append(approx)
+    return simplified
 
 
 def _masks_to_binary_wall_mask(image: np.ndarray, results) -> tuple[np.ndarray, bool]:
@@ -163,14 +257,28 @@ def detect_walls(image: np.ndarray) -> tuple[np.ndarray, list]:
     otsu_mask = _otsu_threshold_mask(enhanced)
     line_mask = _detect_lines_mask(enhanced, image.shape)
     canny_mask = _fallback_canny_wall_mask(enhanced)
+    gradient_mask = _morphological_gradient_mask(enhanced, image.shape)
+    directional_mask = _directional_wall_mask(enhanced, image.shape)
 
-    combined = _combine_wall_masks(adaptive_mask, otsu_mask, line_mask, canny_mask)
+    edges_for_merge = _auto_canny(enhanced)
+    merge_lines = cv2.HoughLinesP(
+        edges_for_merge, rho=1, theta=np.pi / 180,
+        threshold=50, minLineLength=max(20, min(h, w) // 30),
+        maxLineGap=max(5, min(h, w) // 100),
+    )
+    collinear_mask = _merge_collinear_segments(merge_lines, image.shape)
+
+    combined = _combine_wall_masks(
+        adaptive_mask, otsu_mask, line_mask, canny_mask,
+        gradient_mask, directional_mask,
+    )
+    combined = cv2.bitwise_or(combined, collinear_mask)
 
     yolo_mask = np.zeros((h, w), dtype=np.uint8)
     for loader in (get_onnx_model, get_model):
         try:
             model = loader()
-            results = model(image, conf=0.3, iou=0.5, verbose=False)
+            results = model(image, conf=0.25, iou=0.45, verbose=False)
             yolo_mask, had_masks = _masks_to_binary_wall_mask(image, results)
             if had_masks:
                 break
@@ -193,6 +301,7 @@ def detect_walls(image: np.ndarray) -> tuple[np.ndarray, list]:
         wall_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE,
     )
     wall_contours = _filter_contours(contours)
+    wall_contours = _simplify_contours(wall_contours)
 
     clean_mask = np.zeros((h, w), dtype=np.uint8)
     if wall_contours:
@@ -202,6 +311,21 @@ def detect_walls(image: np.ndarray) -> tuple[np.ndarray, list]:
         clean_mask = wall_mask
 
     return clean_mask, wall_contours
+
+
+def _validate_circle(gray: np.ndarray, x: int, y: int, r: int) -> bool:
+    h, w = gray.shape[:2]
+    edges = cv2.Canny(gray, 50, 150)
+    num_samples = max(16, int(2 * np.pi * r))
+    edge_hits = 0
+    for k in range(num_samples):
+        theta = 2 * np.pi * k / num_samples
+        px = int(round(x + r * np.cos(theta)))
+        py = int(round(y + r * np.sin(theta)))
+        if 0 <= px < w and 0 <= py < h:
+            if edges[py, px] > 0:
+                edge_hits += 1
+    return (edge_hits / max(num_samples, 1)) >= 0.30
 
 
 def _detect_door_arcs(
@@ -303,7 +427,6 @@ def detect_fixtures(image: np.ndarray, wall_mask: np.ndarray) -> dict:
 
     fixtures: dict[str, list] = {"lights": [], "doors": [], "windows": []}
 
-    # --- Lights: small circles with adaptive parameters ---
     min_radius = max(3, min(h, w) // 200)
     max_radius = max(15, min(h, w) // 50)
     min_dist = max(20, min(h, w) // 40)
@@ -316,14 +439,17 @@ def detect_fixtures(image: np.ndarray, wall_mask: np.ndarray) -> dict:
             minRadius=min_radius, maxRadius=max_radius,
         )
         if circles is not None:
-            for x, y, r in np.round(circles[0]).astype(int):
+            for cx, cy, cr in np.round(circles[0]).astype(int):
+                if not _validate_circle(enhanced, int(cx), int(cy), int(cr)):
+                    continue
                 if not any(
-                    abs(x - l["x"]) < min_dist and abs(y - l["y"]) < min_dist
+                    abs(cx - l["x"]) < min_dist and abs(cy - l["y"]) < min_dist
                     for l in fixtures["lights"]
                 ):
-                    fixtures["lights"].append({"x": int(x), "y": int(y), "radius": int(r)})
+                    fixtures["lights"].append(
+                        {"x": int(cx), "y": int(cy), "radius": int(cr)}
+                    )
 
-    # --- Doors: arc fitting + shape classification ---
     min_fixture_area = max(100, int(img_area * 0.00005))
     max_fixture_area = max(5000, int(img_area * 0.01))
 

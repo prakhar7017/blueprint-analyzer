@@ -13,7 +13,7 @@ def _is_pdf(data: bytes) -> bool:
 
 
 def _pdf_first_page_to_bytes(data: bytes) -> bytes:
-    import fitz 
+    import fitz
 
     with fitz.open(stream=data, filetype="pdf") as doc:
         page = doc[0]
@@ -101,10 +101,45 @@ def _normalize_blueprint_colors(image_bgr: np.ndarray) -> np.ndarray:
     return best
 
 
+def _mask_text_regions(gray: np.ndarray) -> np.ndarray:
+    h, w = gray.shape[:2]
+    block = max(8, min(h, w) // 80)
+    if block % 2 == 0:
+        block += 1
+
+    local_mean = cv2.blur(gray.astype(np.float32), (block, block))
+    local_sq_mean = cv2.blur((gray.astype(np.float32)) ** 2, (block, block))
+    local_var = local_sq_mean - local_mean ** 2
+    local_var = np.clip(local_var, 0, None)
+
+    var_norm = cv2.normalize(local_var, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    _, high_var = cv2.threshold(var_norm, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    text_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (block, block))
+    text_mask = cv2.morphologyEx(high_var, cv2.MORPH_CLOSE, text_kernel, iterations=1)
+
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(text_mask, connectivity=8)
+    max_text_area = h * w * 0.005
+    min_text_area = max(30, h * w * 0.00002)
+
+    result = gray.copy()
+    bg = int(np.percentile(gray, 95))
+    for i in range(1, num_labels):
+        comp_area = stats[i, cv2.CC_STAT_AREA]
+        comp_w = stats[i, cv2.CC_STAT_WIDTH]
+        comp_h = stats[i, cv2.CC_STAT_HEIGHT]
+        aspect = max(comp_w, comp_h) / max(min(comp_w, comp_h), 1)
+        if min_text_area < comp_area < max_text_area and aspect < 15:
+            result[labels == i] = bg
+
+    return result
+
+
 def preprocess_blueprint(image_bgr: np.ndarray) -> np.ndarray:
     gray = _normalize_blueprint_colors(image_bgr)
     gray = _deskew(gray)
     gray = _remove_border(gray)
+    gray = _mask_text_regions(gray)
     gray = cv2.bilateralFilter(gray, d=9, sigmaColor=75, sigmaSpace=75)
     return gray
 

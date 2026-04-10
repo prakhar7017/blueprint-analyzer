@@ -150,6 +150,18 @@ def detect_rooms(wall_mask: np.ndarray) -> list:
 
     all_contours = _remove_border_contours(all_contours, h, w)
     all_contours = _filter_rooms_by_shape(all_contours, image_area)
+    all_contours = _simplify_room_contours(all_contours)
     all_contours = _merge_overlapping_rooms(all_contours)
 
     return all_contours
+
+
+def _simplify_room_contours(contours: list) -> list:
+    simplified = []
+    for c in contours:
+        peri = cv2.arcLength(c, True)
+        eps = 0.008 * peri
+        approx = cv2.approxPolyDP(c, eps, True)
+        if cv2.contourArea(approx) >= MIN_CONTOUR_AREA:
+            simplified.append(approx)
+    return simplified
