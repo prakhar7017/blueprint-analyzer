@@ -80,10 +80,14 @@ Detected via OpenCV heuristics (no trained model):
 
 **Wall types / tags** would require OCR (e.g. Tesseract), which is outside the specified tech stack. Not implemented.
 
-## Limitations
+## Approach & Design Choices
 
-- The model is **not** trained on blueprints; COCO segmentation rarely matches architectural walls, so the pipeline often relies on **Canny + morphology** as a generic fallback.
-- Room regions are a **heuristic** (inverted wall mask + morphology + contours), not true floor-plan parsing.
-- Wall thickness is a rough pixel estimate, not a calibrated measurement.
-- Fixture detection is **heuristic-based** and will produce false positives/negatives on real blueprints.
-- **Accuracy is not guaranteed**; this is a minimal assignment-style baseline, not production CAD software.
+- **Walls**: The pipeline runs **YOLOv8 segmentation** (ONNX first, PyTorch if ONNX fails). If inference fails or no masks are produced, it falls back to **Gaussian blur + Canny edges + morphological dilation** and contour filtering. It is not a single fused model on every image; it is segmentation with a classical fallback (see **Inference pipeline** above).
+
+- **Pretrained weights**: The default checkpoint is **COCO**-pretrained; all instance masks are merged into one binary wall mask (no architectural class filter). The CV path exists so the service still produces an edge-based mask when segmentation is unusable.
+
+- **Rooms**: The wall mask is inverted, **morphological closing** is applied to the free-space region to bridge small gaps, then **exterior contours** above the same minimum area as walls are treated as room-like regions—fast geometry from the wall mask, not a separate room model.
+
+- **Wall thickness**: **Average thickness in pixels** is computed from OpenCV’s **distance transform** on the binary wall mask (twice the mean distance inside foreground pixels). Values are **not** calibrated to real-world units unless you add scale.
+
+- **Structure**: Code is split into small modules (`wall_detection`, `room_detection`, `model`, `utils`) with FastAPI in `main`, so backends and heuristics can be swapped or improved—for example with domain-specific fine-tuning or custom weights.
